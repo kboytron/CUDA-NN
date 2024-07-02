@@ -1,84 +1,150 @@
 import numpy as np
 from sklearn.datasets import fetch_openml
+from matplotlib import pyplot as plt
 import ctypes
 
-# Load the compiled CUDA kernel
-cuda_lib = ctypes.CDLL('./cuda_kernels.so')
+cudaLib = ctypes.CDLL('./nn_cuda.dll')
 
-# Define the argument types for the CUDA functions
-cuda_lib.matmul.argtypes = [
-    ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float),
-    ctypes.c_int, ctypes.c_int, ctypes.c_int
-]
+cudaLib.relu.argtypes = [np.ctypeslib.ndpointer(dtype=np.float32), ctypes.c_int]
 
-cuda_lib.relu.argtypes = [
-    ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float), ctypes.c_int
-]
+# Fetch the MNIST dataset
+mnist = fetch_openml('mnist_784', version=1)
+data = mnist['data']
+target = mnist['target'].astype(np.int64)
 
-cuda_lib.softmax.argtypes = [
-    ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float), ctypes.c_int
-]
+# Convert to numpy array
+data = np.array(data)
+target = np.array(target)
 
-def to_device(np_array):
-    c_array = np_array.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
-    return c_array
+# Combine data and target for shuffling
+combined = np.c_[target, data]
+np.random.shuffle(combined)
 
-def matmul(A, B, C, n, m, k):
-    cuda_lib.matmul(A, B, C, n, m, k)
+# Split the combined data
+m, n = combined.shape
+dataDev = combined[:1000].T
+yDev = dataDev[0]
+XDev = dataDev[1:n]
+XDev = XDev / 255.0
 
-def relu(Z, A, size):
-    cuda_lib.relu(Z, A, size)
+dataTrain = combined[1000:m].T
+yTrain = dataTrain[0]
+xTrain = dataTrain[1:n]
+xTrain = xTrain / 255.0
 
-def softmax(Z, A, size):
-    cuda_lib.softmax(Z, A, size)
+_, mTrain = xTrain.shape
 
-def init_params():
-    W1 = np.random.rand(10, 784).astype(np.float32) - 0.5
-    b1 = np.random.rand(10, 1).astype(np.float32) - 0.5
-    W2 = np.random.rand(10, 10).astype(np.float32) - 0.5
-    b2 = np.random.rand(10, 1).astype(np.float32) - 0.5
+
+def initParams():
+    W1 = np.random.randn(10, 784) * 0.01
+    b1 = np.zeros((10, 1))
+    W2 = np.random.randn(10, 10) * 0.01
+    b2 = np.zeros((10, 1))
     return W1, b1, W2, b2
 
-def load_and_preprocess_data():
-    mnist = fetch_openml('mnist_784', version=1)
-    X, y = mnist["data"], mnist["target"]
-    X = X / 255.0
-    y = y.astype(int)
-    Y = np.eye(10)[y]
-    X_train, X_test = X[:60000], X[60000:]
-    Y_train, Y_test = Y[:60000], Y[60000:]
-    return X_train, Y_train, X_test, Y_test
 
-X_train, Y_train, X_test, Y_test = load_and_preprocess_data()
-W1, b1, W2, b2 = init_params()
+def softmax(Z):
+    Z -= np.max(Z, axis=0)  # Subtract max value for numerical stability
+    A = np.exp(Z) / np.sum(np.exp(Z), axis=0)
+    return A
 
-def forward_prop(W1, b1, W2, b2, X):
-    n, m = W1.shape
-    k = X.shape[0]
 
-    Z1 = np.zeros((n, X.shape[1]), dtype=np.float32)
-    A1 = np.zeros_like(Z1)
-    Z2 = np.zeros((W2.shape[0], X.shape[1]), dtype=np.float32)
-    A2 = np.zeros_like(Z2)
-
-    W1_ctypes = to_device(W1)
-    b1_ctypes = to_device(b1)
-    W2_ctypes = to_device(W2)
-    b2_ctypes = to_device(b2)
-    X_ctypes = to_device(X)
-    Z1_ctypes = to_device(Z1)
-    A1_ctypes = to_device(A1)
-    Z2_ctypes = to_device(Z2)
-    A2_ctypes = to_device(A2)
-
-    matmul(W1_ctypes, X_ctypes, Z1_ctypes, n, X.shape[1], m)
-    Z1 += b1
-    relu(Z1_ctypes, A1_ctypes, Z1.size)
-    matmul(W2_ctypes, A1_ctypes, Z2_ctypes, W2.shape[0], A1.shape[1], W2.shape[1])
-    Z2 += b2
-    softmax(Z2_ctypes, A2_ctypes, Z2.size)
-
+def forwardProp(W1, b1, W2, b2, X):
+    Z1 = W1.dot(X) + b1
+    A1 = relu(Z1)
+    Z2 = W2.dot(A1) + b2
+    A2 = softmax(Z2)
     return Z1, A1, Z2, A2
 
-Z1, A1, Z2, A2 = forward_prop(W1, b1, W2, b2, X_train.T)
-print("Forward propagation result:", A2)
+
+def relu(Z):
+    Z_flat = Z.ravel().astype(np.float32)
+    cudaLib.relu(Z_flat, Z_flat.size)
+    return Z_flat.reshape(Z.shape)
+
+
+def reluDeriv(Z):
+    return Z > 0
+
+
+def oneHot(Y):
+    oneHotY = np.zeros((Y.size, Y.max() + 1))
+    oneHotY[np.arange(Y.size), Y] = 1
+    oneHotY = oneHotY.T
+    return oneHotY
+
+
+def backwardProp(Z1, A1, Z2, A2, W1, W2, X, oneHotY, mTrain):
+    dZ2 = A2 - oneHotY
+    dW2 = 1 / mTrain * dZ2.dot(A1.T)
+    db2 = 1 / mTrain * np.sum(dZ2, axis=1, keepdims=True)
+    dZ1 = W2.T.dot(dZ2) * reluDeriv(Z1)
+    dW1 = 1 / mTrain * dZ1.dot(X.T)
+    db1 = 1 / mTrain * np.sum(dZ1, axis=1, keepdims=True)
+    return dW1, db1, dW2, db2
+
+
+def updateParams(W1, b1, W2, b2, dW1, db1, dW2, db2, alpha):
+    W1 -= alpha * dW1
+    b1 -= alpha * db1    
+    W2 -= alpha * dW2  
+    b2 -= alpha * db2    
+    return W1, b1, W2, b2
+
+
+def getPredictions(A2):
+    return np.argmax(A2, 0)
+
+
+def getAccuracy(predictions, Y):
+    return np.mean(predictions == Y)
+
+
+def gradientDescent(X, Y, alpha, iterations, threshold=0.025):
+    W1, b1, W2, b2 = initParams()
+    oneHotY = oneHot(Y)
+    prev_accuracy = 0
+    for i in range(iterations):
+        Z1, A1, Z2, A2 = forwardProp(W1, b1, W2, b2, X)
+        dW1, db1, dW2, db2 = backwardProp(Z1, A1, Z2, A2, W1, W2, X, oneHotY, mTrain)
+        W1, b1, W2, b2 = updateParams(W1, b1, W2, b2, dW1, db1, dW2, db2, alpha)
+        if i % 100 == 0:
+            predictions = getPredictions(A2)
+            accuracy = getAccuracy(predictions, Y)
+            print(f"Iteration: {i}, Accuracy: {accuracy}")
+            if abs(accuracy - prev_accuracy) < threshold:
+                print("Early stopping as accuracy change is below threshold")
+                break
+            prev_accuracy = accuracy
+    return W1, b1, W2, b2
+
+
+def makePredictions(X, W1, b1, W2, b2):
+    _, _, _, A2 = forwardProp(W1, b1, W2, b2, X)
+    predictions = getPredictions(A2)
+    return predictions
+
+
+def testPrediction(index, W1, b1, W2, b2):
+    currentImage = xTrain[:, index, None]
+    prediction = makePredictions(currentImage, W1, b1, W2, b2)
+    label = yTrain[index]
+    print(f"Prediction: {prediction}, Label: {label}")
+    
+    currentImage = currentImage.reshape((28, 28)) * 255
+    plt.gray()
+    plt.imshow(currentImage, interpolation='nearest')
+    plt.show()
+
+# Training the model
+W1, b1, W2, b2 = gradientDescent(xTrain, yTrain, 0.10, 1500)
+
+# Testing predictions
+# testPrediction(0, W1, b1, W2, b2)
+# testPrediction(1, W1, b1, W2, b2)
+# testPrediction(2, W1, b1, W2, b2)
+# testPrediction(3, W1, b1, W2, b2)
+
+# Evaluating on the dev set
+devPredictions = makePredictions(XDev, W1, b1, W2, b2)
+print("Dev set accuracy:", getAccuracy(devPredictions, yDev))
