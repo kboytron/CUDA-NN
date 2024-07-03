@@ -6,6 +6,19 @@ import ctypes
 cudaLib = ctypes.CDLL('./nn_cuda.dll')
 
 cudaLib.relu.argtypes = [np.ctypeslib.ndpointer(dtype=np.float32), ctypes.c_int]
+cudaLib.relu.restype = None
+
+cudaLib.softmax.argtypes = [np.ctypeslib.ndpointer(dtype=np.float32), np.ctypeslib.ndpointer(dtype=np.float32), ctypes.c_int, ctypes.c_int]
+cudaLib.softmax.restype = None
+
+cudaLib.forwardProp.argtypes = [np.ctypeslib.ndpointer(dtype=np.float32), np.ctypeslib.ndpointer(dtype=np.float32), np.ctypeslib.ndpointer(dtype=np.float32), np.ctypeslib.ndpointer(dtype=np.float32), ctypes.c_int, ctypes.c_int, ctypes.c_int]
+cudaLib.forwardProp.restype = None
+
+cudaLib.reluDeriv.argtypes = [np.ctypeslib.ndpointer(dtype=np.float32), np.ctypeslib.ndpointer(dtype=np.float32), ctypes.c_int]
+cudaLib.reluDeriv.restype = None
+
+cudaLib.backwardProp.argtypes = [np.ctypeslib.ndpointer(dtype=np.float32), np.ctypeslib.ndpointer(dtype=np.float32), np.ctypeslib.ndpointer(dtype=np.float32), np.ctypeslib.ndpointer(dtype=np.float32), ctypes.c_int, ctypes.c_int, ctypes.c_int]
+cudaLib.backwardProp.restype = None
 
 # Fetch the MNIST dataset
 mnist = fetch_openml('mnist_784', version=1)
@@ -44,15 +57,17 @@ def initParams():
 
 
 def softmax(Z):
-    Z -= np.max(Z, axis=0)  # Subtract max value for numerical stability
-    A = np.exp(Z) / np.sum(np.exp(Z), axis=0)
+    A = np.zeros_like(Z, dtype=np.float32)
+    cudaLib.softmax(Z.astype(np.float32), A, Z.shape[0], Z.shape[1])
     return A
 
 
 def forwardProp(W1, b1, W2, b2, X):
-    Z1 = W1.dot(X) + b1
+    Z1 = np.zeros((W1.shape[0], X.shape[1]), dtype=np.float32)
+    cudaLib.forwardProp(W1.astype(np.float32), b1.astype(np.float32), X.astype(np.float32), Z1, W1.shape[0], W1.shape[1], X.shape[1])
     A1 = relu(Z1)
-    Z2 = W2.dot(A1) + b2
+    Z2 = np.zeros((W2.shape[0], A1.shape[1]), dtype=np.float32)
+    cudaLib.forwardProp(W2.astype(np.float32), b2.astype(np.float32), A1.astype(np.float32), Z2, W2.shape[0], W2.shape[1], A1.shape[1])
     A2 = softmax(Z2)
     return Z1, A1, Z2, A2
 
@@ -64,7 +79,9 @@ def relu(Z):
 
 
 def reluDeriv(Z):
-    return Z > 0
+    dZ = np.ones_like(Z, dtype=np.float32)
+    cudaLib.reluDeriv(Z.astype(np.float32), dZ, Z.size)
+    return dZ
 
 
 def oneHot(Y):
